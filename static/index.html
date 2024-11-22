@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>大文件上传示例</title>
+</head>
+<body>
+    <h1>大文件上传示例</h1>
+    <input type="file" id="fileInput">
+    <button onclick="uploadFile()">上传</button>
+    <div id="progress"></div>
+
+    <!-- 引入 SparkMD5 库 -->
+    <script src="https://cdn.bootcdn.net/ajax/libs/spark-md5/3.0.2/spark-md5.min.js"></script>
+    <script>
+        const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert("请选择一个文件！");
+                return;
+            }
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const fileHash = await calculateHash(file);
+
+            const uploadedChunks = await checkUploadedChunks(fileHash, totalChunks);
+
+            for (let i = 0; i < totalChunks; i++) {
+                if (uploadedChunks.includes(i)) {
+                    // 跳过已上传的分片
+                    updateProgress(i + 1, totalChunks);
+                    continue;
+                }
+
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(file.size, start + CHUNK_SIZE);
+                const chunk = file.slice(start, end);
+
+                const formData = new FormData();
+                formData.append("fileHash", fileHash);
+                formData.append("chunkIndex", i);
+                formData.append("file", chunk);
+
+                // 上传分片
+                await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                updateProgress(i + 1, totalChunks);
+            }
+
+            // 通知服务器合并分片
+            const mergeData = new FormData();
+            mergeData.append("fileHash", fileHash);
+            mergeData.append("totalChunks", totalChunks);
+            mergeData.append("filename", file.name);
+
+            await fetch('/merge', {
+                method: 'POST',
+                body: mergeData
+            });
+
+            alert("文件上传成功！");
+        }
+
+        // 用于在文件上传过程中更新页面上的上传进度显示，告诉用户当前的上传百分比
+        function updateProgress(uploaded, total) {
+            const progress = ((uploaded / total) * 100).toFixed(2);
+            document.getElementById('progress').innerText = `上传进度：${progress}%`;
+        }
+
+        // 计算文件哈希（MD5）
+        function calculateHash(file) {
+            return new Promise((resolve, reject) => {
+                const chunkSize = 2097152; // 2MB
+                const spark = new SparkMD5.ArrayBuffer();
+                const fileReader = new FileReader();
+                let cursor = 0;
+
+                fileReader.onerror = function () {
+                    reject('文件读取错误');
+                };
+
+                function processChunk(chunkStart) {
+                    const chunkEnd = Math.min(file.size, chunkStart + chunkSize);
+                    fileReader.readAsArrayBuffer(file.slice(chunkStart, chunkEnd));
+                }
+
+                fileReader.onload = function (e) {
+                    spark.append(e.target.result);
+                    cursor += chunkSize;
+
+                    if (cursor < file.size) {
+                        processChunk(cursor);
+                    } else {
+                        const result = spark.end();
+                        resolve(result);
+                    }
+                };
+
+                processChunk(0);
+            });
+        }
+
+        // 检查已上传的分片（用于断点续传）
+        async function checkUploadedChunks(fileHash, totalChunks) {
+            const formData = new FormData();
+            formData.append("fileHash", fileHash);
+            formData.append("totalChunks", totalChunks);
+
+            const response = await fetch('/check', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                return data.uploaded;
+            } else {
+                return [];
+            }
+        }
+    </script>
+</body>
+</html>
