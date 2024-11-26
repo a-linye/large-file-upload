@@ -1,129 +1,111 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>大文件上传示例</title>
-</head>
-<body>
-    <h1>大文件上传示例</h1>
-    <input type="file" id="fileInput">
-    <button onclick="uploadFile()">上传</button>
-    <div id="progress"></div>
-
-    <!-- 引入 SparkMD5 库 -->
-    <script src="https://cdn.bootcdn.net/ajax/libs/spark-md5/3.0.2/spark-md5.min.js"></script>
+    <title>大文件分片上传和断点续传示例</title>
     <script>
-        const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+        const chunkSize = 5 * 1024 * 1024; // 每个分片的大小（5MB）
+        let uploadID = null;
 
+        // 更新上传进度
+        function updateProgress(uploadedChunks, totalChunks) {
+            const progressElement = document.getElementById('progress');
+            const percent = ((uploadedChunks / totalChunks) * 100).toFixed(2);
+            progressElement.innerText = `上传进度：${percent}%`;
+        }
+
+        // 获取已上传的分片
+        async function getUploadedParts(fileName) {
+            const response = await fetch(`/upload-status?upload_id=${uploadID}&filename=${encodeURIComponent(fileName)}`);
+            const data = await response.json();
+            return data.uploaded_parts || [];
+        }
+
+        // 上传文件的函数
         async function uploadFile() {
             const fileInput = document.getElementById('fileInput');
             const file = fileInput.files[0];
             if (!file) {
-                alert("请选择一个文件！");
+                alert('请选择一个文件');
                 return;
             }
 
-            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-            const fileHash = await calculateHash(file);
+            // 生成上传ID
+            if (!uploadID) {
+                uploadID = 'upload_' + new Date().getTime();
+            }
 
-            const uploadedChunks = await checkUploadedChunks(fileHash, totalChunks);
+            const totalChunks = Math.ceil(file.size / chunkSize);
+            let uploadedChunks = 0;
 
-            for (let i = 0; i < totalChunks; i++) {
-                if (uploadedChunks.includes(i)) {
-                    // 跳过已上传的分片
-                    updateProgress(i + 1, totalChunks);
+            // 获取已上传的分片
+            const uploadedParts = await getUploadedParts(file.name);
+
+            // 上传每个分片
+            for (let partNumber = 1; partNumber <= totalChunks; partNumber++) {
+                const partName = `${partNumber}`;
+                if (uploadedParts.includes(partName)) {
+                    uploadedChunks++;
+                    updateProgress(uploadedChunks, totalChunks);
                     continue;
                 }
 
-                const start = i * CHUNK_SIZE;
-                const end = Math.min(file.size, start + CHUNK_SIZE);
+                const start = (partNumber - 1) * chunkSize;
+                const end = Math.min(start + chunkSize, file.size);
                 const chunk = file.slice(start, end);
 
                 const formData = new FormData();
-                formData.append("fileHash", fileHash);
-                formData.append("chunkIndex", i);
-                formData.append("file", chunk);
+                formData.append('file', chunk);
+                formData.append('filename', file.name);
+                formData.append('part_number', partNumber);
+                formData.append('total_parts', totalChunks);
+                formData.append('upload_id', uploadID);
 
-                // 上传分片
-                await fetch('/upload', {
-                    method: 'POST',
-                    body: formData
-                });
+                try {
+                    const response = await fetch('/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
 
-                updateProgress(i + 1, totalChunks);
+                    if (!response.ok) {
+                        console.error(`分片 ${partNumber} 上传失败，状态码：${response.status}`);
+                        partNumber--; // 重试当前分片
+                        continue;
+                    }
+
+                    uploadedChunks++;
+                    updateProgress(uploadedChunks, totalChunks);
+                } catch (error) {
+                    console.error(`分片 ${partNumber} 上传失败，错误：`, error);
+                    partNumber--; // 重试当前分片
+                }
             }
 
-            // 通知服务器合并分片
-            const mergeData = new FormData();
-            mergeData.append("fileHash", fileHash);
-            mergeData.append("totalChunks", totalChunks);
-            mergeData.append("filename", file.name);
-
-            await fetch('/merge', {
+            // 所有分片上传完成，发送合并请求
+            const mergeResponse = await fetch('/merge', {
                 method: 'POST',
-                body: mergeData
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: new URLSearchParams({
+                    upload_id: uploadID,
+                    filename: file.name,
+                }),
             });
 
-            alert("文件上传成功！");
-        }
-
-        // 用于在文件上传过程中更新页面上的上传进度显示，告诉用户当前的上传百分比
-        function updateProgress(uploaded, total) {
-            const progress = ((uploaded / total) * 100).toFixed(2);
-            document.getElementById('progress').innerText = `上传进度：${progress}%`;
-        }
-
-        // 计算文件哈希（MD5）
-        function calculateHash(file) {
-            return new Promise((resolve, reject) => {
-                const chunkSize = 2097152; // 2MB
-                const spark = new SparkMD5.ArrayBuffer();
-                const fileReader = new FileReader();
-                let cursor = 0;
-
-                fileReader.onerror = function () {
-                    reject('文件读取错误');
-                };
-
-                function processChunk(chunkStart) {
-                    const chunkEnd = Math.min(file.size, chunkStart + chunkSize);
-                    fileReader.readAsArrayBuffer(file.slice(chunkStart, chunkEnd));
-                }
-
-                fileReader.onload = function (e) {
-                    spark.append(e.target.result);
-                    cursor += chunkSize;
-
-                    if (cursor < file.size) {
-                        processChunk(cursor);
-                    } else {
-                        const result = spark.end();
-                        resolve(result);
-                    }
-                };
-
-                processChunk(0);
-            });
-        }
-
-        // 检查已上传的分片（用于断点续传）
-        async function checkUploadedChunks(fileHash, totalChunks) {
-            const formData = new FormData();
-            formData.append("fileHash", fileHash);
-            formData.append("totalChunks", totalChunks);
-
-            const response = await fetch('/check', {
-                method: 'POST',
-                body: formData
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                return data.uploaded;
+            const mergeResult = await mergeResponse.json();
+            if (mergeResponse.ok) {
+                alert('文件上传并合并成功');
             } else {
-                return [];
+                alert(`文件上传完成，但合并失败：${mergeResult.error}`);
             }
         }
     </script>
+</head>
+<body>
+    <h1>大文件分片上传和断点续传示例</h1>
+    <input type="file" id="fileInput" />
+    <button onclick="uploadFile()">上传文件</button>
+    <div id="progress">上传进度：0%</div>
 </body>
 </html>
